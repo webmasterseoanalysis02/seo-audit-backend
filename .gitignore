@@ -1,0 +1,17 @@
+﻿Lib/
+Scripts/
+Include/
+etc/
+share/
+pyvenv.cfg
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+env/
+
+.env
+*.log
+
+*.docx
