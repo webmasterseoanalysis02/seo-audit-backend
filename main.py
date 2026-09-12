@@ -164,7 +164,146 @@ async def get_backlinks(domain: str = Query(..., description="Bare domain, e.g. 
 
 
 # =========================================================================
-# 3. REAL ORGANIC TRAFFIC — stubbed, uses Google Search Console (official, free)
+# 4. PDF CLIENT REPORT — fully working, no API key required
+# =========================================================================
+# Takes the issues the bookmarklet already found (Issue/Warning/Opportunity,
+# exactly the vocabulary it already uses internally) and renders a clean,
+# client-ready PDF with the same severity colors as the tool itself.
+
+from io import BytesIO
+from datetime import datetime, timezone
+
+from fastapi.responses import Response
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
+
+
+class IssueItem(BaseModel):
+    name: str
+    type: str  # "Issue" | "Warning" | "Opportunity"
+    priority: str  # "High" | "Medium" | "Low"
+    count: int = 1
+
+
+class ReportRequest(BaseModel):
+    url: str
+    domain: str
+    summary: dict[str, str] = {}
+    issues: list[IssueItem] = []
+
+
+_SEVERITY_COLOR = {
+    "Issue": colors.HexColor("#B23A2E"),
+    "Warning": colors.HexColor("#B8720A"),
+    "Opportunity": colors.HexColor("#1F6F54"),
+}
+_SEVERITY_BG = {
+    "Issue": colors.HexColor("#FBEAE7"),
+    "Warning": colors.HexColor("#FCEFDC"),
+    "Opportunity": colors.HexColor("#E7F5EE"),
+}
+_SEVERITY_ORDER = {"Issue": 0, "Warning": 1, "Opportunity": 2}
+
+
+def _build_report_pdf(req: ReportRequest) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        topMargin=22 * mm, bottomMargin=18 * mm, leftMargin=18 * mm, rightMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleX", parent=styles["Title"], alignment=TA_LEFT, fontSize=20, spaceAfter=2)
+    sub_style = ParagraphStyle("SubX", parent=styles["Normal"], textColor=colors.HexColor("#5B6660"), fontSize=10, spaceAfter=16)
+    h2_style = ParagraphStyle("H2X", parent=styles["Heading2"], fontSize=13, spaceBefore=16, spaceAfter=8)
+    cell_name = ParagraphStyle("CellName", parent=styles["Normal"], fontSize=10, textColor=colors.HexColor("#151A16"), leading=13)
+    cell_meta = ParagraphStyle("CellMeta", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#5B6660"), leading=11)
+
+    story = [
+        Paragraph("SEO Audit Report", title_style),
+        Paragraph(f"{req.url}<br/>Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d')}", sub_style),
+    ]
+
+    counts = {"Issue": 0, "Warning": 0, "Opportunity": 0}
+    for it in req.issues:
+        counts[it.type] = counts.get(it.type, 0) + 1
+
+    badge_style = ParagraphStyle("badge", parent=styles["Normal"], alignment=1, textColor=colors.white)
+    badge_data = [[
+        Paragraph(f"<b>{counts.get('Issue', 0)} Issues</b>", badge_style),
+        Paragraph(f"<b>{counts.get('Warning', 0)} Warnings</b>", badge_style),
+        Paragraph(f"<b>{counts.get('Opportunity', 0)} Opportunities</b>", badge_style),
+    ]]
+    badge_table = Table(badge_data, colWidths=[55 * mm, 55 * mm, 55 * mm], rowHeights=[9 * mm])
+    badge_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), _SEVERITY_COLOR["Issue"]),
+        ("BACKGROUND", (1, 0), (1, 0), _SEVERITY_COLOR["Warning"]),
+        ("BACKGROUND", (2, 0), (2, 0), _SEVERITY_COLOR["Opportunity"]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(badge_table)
+
+    if req.summary:
+        story.append(Paragraph("Page summary", h2_style))
+        sum_rows = [[Paragraph(f"<b>{k}</b>", cell_meta), Paragraph(v or "&mdash;", cell_name)] for k, v in req.summary.items()]
+        sum_table = Table(sum_rows, colWidths=[35 * mm, 130 * mm])
+        sum_table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(sum_table)
+
+    if req.issues:
+        story.append(Paragraph("Findings", h2_style))
+        issues_sorted = sorted(req.issues, key=lambda x: _SEVERITY_ORDER.get(x.type, 3))
+        find_rows = []
+        for it in issues_sorted:
+            color = _SEVERITY_COLOR.get(it.type, colors.grey)
+            combined = Paragraph(
+                f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.priority} priority &middot; {it.count} occurrence(s)</font>",
+                cell_name,
+            )
+            type_p = Paragraph(
+                f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>",
+                ParagraphStyle("typeX", parent=styles["Normal"], alignment=2, fontSize=9),
+            )
+            find_rows.append([combined, type_p])
+
+        find_table = Table(find_rows, colWidths=[130 * mm, 35 * mm])
+        style_cmds = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+        ]
+        for idx, it in enumerate(issues_sorted):
+            bg = _SEVERITY_BG.get(it.type)
+            if bg:
+                style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
+        find_table.setStyle(TableStyle(style_cmds))
+        story.append(find_table)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+@app.post("/api/report/pdf")
+def generate_pdf_report(req: ReportRequest):
+    pdf_bytes = _build_report_pdf(req)
+    filename = f"seo-audit-{req.domain}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 # =========================================================================
 # This is the one genuinely free, genuinely accurate traffic source that
 # exists — because it's Google's own data. The catch: it only works for
