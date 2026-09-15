@@ -189,24 +189,35 @@ class IssueItem(BaseModel):
     count: int = 1
 
 
+class FindingItem(BaseModel):
+    name: str
+    type: str  # "Issue" | "Warning" | "Opportunity" | "Good"
+    detail: str = ""
+
+
 class ReportRequest(BaseModel):
     url: str
     domain: str
     summary: dict[str, str] = {}
     issues: list[IssueItem] = []
+    schema_findings: list[FindingItem] = []
+    ai_findings: list[FindingItem] = []
+    tech_stack: list[str] = []
 
 
 _SEVERITY_COLOR = {
     "Issue": colors.HexColor("#B23A2E"),
     "Warning": colors.HexColor("#B8720A"),
     "Opportunity": colors.HexColor("#1F6F54"),
+    "Good": colors.HexColor("#1F6F54"),
 }
 _SEVERITY_BG = {
     "Issue": colors.HexColor("#FBEAE7"),
     "Warning": colors.HexColor("#FCEFDC"),
     "Opportunity": colors.HexColor("#E7F5EE"),
+    "Good": colors.HexColor("#E7F5EE"),
 }
-_SEVERITY_ORDER = {"Issue": 0, "Warning": 1, "Opportunity": 2}
+_SEVERITY_ORDER = {"Issue": 0, "Warning": 1, "Opportunity": 2, "Good": 3}
 
 
 def _build_report_pdf(req: ReportRequest) -> bytes:
@@ -287,6 +298,56 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
                 style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
         find_table.setStyle(TableStyle(style_cmds))
         story.append(find_table)
+
+    if req.schema_findings:
+        story.append(Paragraph("Schema.org markup", h2_style))
+        rows = []
+        for it in sorted(req.schema_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4)):
+            color = _SEVERITY_COLOR.get(it.type, colors.grey)
+            combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.detail}</font>", cell_name)
+            type_p = Paragraph(f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>", ParagraphStyle("typeS", parent=styles["Normal"], alignment=2, fontSize=9))
+            rows.append([combined, type_p])
+        tbl = Table(rows, colWidths=[130 * mm, 35 * mm])
+        style_cmds = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+        ]
+        for idx, it in enumerate(sorted(req.schema_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4))):
+            bg = _SEVERITY_BG.get(it.type)
+            if bg:
+                style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
+        tbl.setStyle(TableStyle(style_cmds))
+        story.append(tbl)
+
+    if req.ai_findings:
+        story.append(Paragraph("AI crawler & answer-engine readiness", h2_style))
+        sorted_ai = sorted(req.ai_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4))
+        rows = []
+        for it in sorted_ai:
+            color = _SEVERITY_COLOR.get(it.type, colors.grey)
+            combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.detail}</font>", cell_name)
+            type_p = Paragraph(f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>", ParagraphStyle("typeA", parent=styles["Normal"], alignment=2, fontSize=9))
+            rows.append([combined, type_p])
+        tbl2 = Table(rows, colWidths=[130 * mm, 35 * mm])
+        style_cmds2 = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+        ]
+        for idx, it in enumerate(sorted_ai):
+            bg = _SEVERITY_BG.get(it.type)
+            if bg:
+                style_cmds2.append(("BACKGROUND", (0, idx), (-1, idx), bg))
+        tbl2.setStyle(TableStyle(style_cmds2))
+        story.append(tbl2)
+
+    if req.tech_stack:
+        story.append(Paragraph("Detected technologies", h2_style))
+        tech_text = " &middot; ".join(req.tech_stack)
+        story.append(Paragraph(tech_text, cell_name))
 
     doc.build(story)
     buf.seek(0)
