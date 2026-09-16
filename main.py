@@ -202,6 +202,7 @@ class ReportRequest(BaseModel):
     issues: list[IssueItem] = []
     schema_findings: list[FindingItem] = []
     ai_findings: list[FindingItem] = []
+    performance_findings: list[FindingItem] = []
     tech_stack: list[str] = []
 
 
@@ -218,6 +219,49 @@ _SEVERITY_BG = {
     "Good": colors.HexColor("#E7F5EE"),
 }
 _SEVERITY_ORDER = {"Issue": 0, "Warning": 1, "Opportunity": 2, "Good": 3}
+
+
+def _section_divider(text: str, styles) -> Table:
+    style = ParagraphStyle("divider", parent=styles["Normal"], textColor=colors.white, fontSize=12, alignment=0)
+    tbl = Table([[Paragraph(f"<b>{text}</b>", style)]], colWidths=[165 * mm], rowHeights=[10 * mm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#151A16")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 20),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    return tbl
+
+
+def _finding_table(items, styles, cell_name) -> Table:
+    """items: objects with .name, .type, and either (.priority, .count) or .detail"""
+    items_sorted = sorted(items, key=lambda x: _SEVERITY_ORDER.get(x.type, 4))
+    rows = []
+    for it in items_sorted:
+        color = _SEVERITY_COLOR.get(it.type, colors.grey)
+        sub = getattr(it, "detail", None)
+        if sub is None:
+            sub = f"{it.priority} priority &middot; {it.count} occurrence(s)"
+        combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{sub}</font>", cell_name)
+        type_p = Paragraph(
+            f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>",
+            ParagraphStyle(f"type{id(it)}", parent=styles["Normal"], alignment=2, fontSize=9),
+        )
+        rows.append([combined, type_p])
+    tbl = Table(rows, colWidths=[130 * mm, 35 * mm])
+    style_cmds = [
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+    ]
+    for idx, it in enumerate(items_sorted):
+        bg = _SEVERITY_BG.get(it.type)
+        if bg:
+            style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
+    tbl.setStyle(TableStyle(style_cmds))
+    return tbl
 
 
 def _build_report_pdf(req: ReportRequest) -> bytes:
@@ -238,9 +282,11 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
         Paragraph(f"{req.url}<br/>Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d')}", sub_style),
     ]
 
+    all_findings = list(req.issues) + list(req.schema_findings) + list(req.ai_findings) + list(req.performance_findings)
     counts = {"Issue": 0, "Warning": 0, "Opportunity": 0}
-    for it in req.issues:
-        counts[it.type] = counts.get(it.type, 0) + 1
+    for it in all_findings:
+        if it.type in counts:
+            counts[it.type] += 1
 
     badge_style = ParagraphStyle("badge", parent=styles["Normal"], alignment=1, textColor=colors.white)
     badge_data = [[
@@ -257,6 +303,9 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
     ]))
     story.append(badge_table)
 
+    # ---- SEO REPORT section ----
+    story.append(_section_divider("SEO REPORT", styles))
+
     if req.summary:
         story.append(Paragraph("Page summary", h2_style))
         sum_rows = [[Paragraph(f"<b>{k}</b>", cell_meta), Paragraph(v or "&mdash;", cell_name)] for k, v in req.summary.items()]
@@ -271,78 +320,21 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
 
     if req.issues:
         story.append(Paragraph("Findings", h2_style))
-        issues_sorted = sorted(req.issues, key=lambda x: _SEVERITY_ORDER.get(x.type, 3))
-        find_rows = []
-        for it in issues_sorted:
-            color = _SEVERITY_COLOR.get(it.type, colors.grey)
-            combined = Paragraph(
-                f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.priority} priority &middot; {it.count} occurrence(s)</font>",
-                cell_name,
-            )
-            type_p = Paragraph(
-                f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>",
-                ParagraphStyle("typeX", parent=styles["Normal"], alignment=2, fontSize=9),
-            )
-            find_rows.append([combined, type_p])
-
-        find_table = Table(find_rows, colWidths=[130 * mm, 35 * mm])
-        style_cmds = [
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
-        ]
-        for idx, it in enumerate(issues_sorted):
-            bg = _SEVERITY_BG.get(it.type)
-            if bg:
-                style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
-        find_table.setStyle(TableStyle(style_cmds))
-        story.append(find_table)
+        story.append(_finding_table(req.issues, styles, cell_name))
 
     if req.schema_findings:
         story.append(Paragraph("Schema.org markup", h2_style))
-        rows = []
-        for it in sorted(req.schema_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4)):
-            color = _SEVERITY_COLOR.get(it.type, colors.grey)
-            combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.detail}</font>", cell_name)
-            type_p = Paragraph(f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>", ParagraphStyle("typeS", parent=styles["Normal"], alignment=2, fontSize=9))
-            rows.append([combined, type_p])
-        tbl = Table(rows, colWidths=[130 * mm, 35 * mm])
-        style_cmds = [
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
-        ]
-        for idx, it in enumerate(sorted(req.schema_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4))):
-            bg = _SEVERITY_BG.get(it.type)
-            if bg:
-                style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
-        tbl.setStyle(TableStyle(style_cmds))
-        story.append(tbl)
+        story.append(_finding_table(req.schema_findings, styles, cell_name))
 
+    if req.performance_findings:
+        story.append(Paragraph("Performance (Core Web Vitals)", h2_style))
+        story.append(_finding_table(req.performance_findings, styles, cell_name))
+
+    # ---- AI-SEO (GEO / AEO) REPORT section ----
     if req.ai_findings:
+        story.append(_section_divider("AI-SEO REPORT (GEO / AEO)", styles))
         story.append(Paragraph("AI crawler & answer-engine readiness", h2_style))
-        sorted_ai = sorted(req.ai_findings, key=lambda x: _SEVERITY_ORDER.get(x.type, 4))
-        rows = []
-        for it in sorted_ai:
-            color = _SEVERITY_COLOR.get(it.type, colors.grey)
-            combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{it.detail}</font>", cell_name)
-            type_p = Paragraph(f"<font color='{color.hexval()}'><b>{it.type.upper()}</b></font>", ParagraphStyle("typeA", parent=styles["Normal"], alignment=2, fontSize=9))
-            rows.append([combined, type_p])
-        tbl2 = Table(rows, colWidths=[130 * mm, 35 * mm])
-        style_cmds2 = [
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 8),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
-        ]
-        for idx, it in enumerate(sorted_ai):
-            bg = _SEVERITY_BG.get(it.type)
-            if bg:
-                style_cmds2.append(("BACKGROUND", (0, idx), (-1, idx), bg))
-        tbl2.setStyle(TableStyle(style_cmds2))
-        story.append(tbl2)
+        story.append(_finding_table(req.ai_findings, styles, cell_name))
 
     if req.tech_stack:
         story.append(Paragraph("Detected technologies", h2_style))
@@ -358,6 +350,128 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
 def generate_pdf_report(req: ReportRequest):
     pdf_bytes = _build_report_pdf(req)
     filename = f"seo-audit-{req.domain}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class SitePageFinding(BaseModel):
+    name: str
+    type: str
+    count: int | None = None
+
+
+class SitePageResult(BaseModel):
+    url: str
+    findings: list[SitePageFinding] = []
+
+
+class SiteReportRequest(BaseModel):
+    domain: str
+    pages: list[SitePageResult] = []
+
+
+def _build_site_pdf(req: SiteReportRequest) -> bytes:
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        topMargin=22 * mm, bottomMargin=18 * mm, leftMargin=18 * mm, rightMargin=18 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TitleX2", parent=styles["Title"], alignment=TA_LEFT, fontSize=20, spaceAfter=2)
+    sub_style = ParagraphStyle("SubX2", parent=styles["Normal"], textColor=colors.HexColor("#5B6660"), fontSize=10, spaceAfter=16)
+    h2_style = ParagraphStyle("H2X2", parent=styles["Heading2"], fontSize=13, spaceBefore=16, spaceAfter=8)
+    cell_name = ParagraphStyle("CellName2", parent=styles["Normal"], fontSize=10, textColor=colors.HexColor("#151A16"), leading=13)
+
+    story = [
+        Paragraph("Full Site SEO Audit", title_style),
+        Paragraph(f"{req.domain}<br/>Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d')} &middot; {len(req.pages)} page(s) checked", sub_style),
+    ]
+
+    counts = {"Issue": 0, "Warning": 0, "Opportunity": 0}
+    by_check: dict[str, dict] = {}
+    for pg in req.pages:
+        for f in pg.findings:
+            if f.type in counts:
+                counts[f.type] += 1
+            by_check.setdefault(f.name, {"count": 0, "type": f.type})
+            by_check[f.name]["count"] += 1
+
+    badge_style = ParagraphStyle("badge2", parent=styles["Normal"], alignment=1, textColor=colors.white)
+    badge_data = [[
+        Paragraph(f"<b>{counts.get('Issue', 0)} Issues</b>", badge_style),
+        Paragraph(f"<b>{counts.get('Warning', 0)} Warnings</b>", badge_style),
+        Paragraph(f"<b>{counts.get('Opportunity', 0)} Opportunities</b>", badge_style),
+    ]]
+    badge_table = Table(badge_data, colWidths=[55 * mm, 55 * mm, 55 * mm], rowHeights=[9 * mm])
+    badge_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, 0), _SEVERITY_COLOR["Issue"]),
+        ("BACKGROUND", (1, 0), (1, 0), _SEVERITY_COLOR["Warning"]),
+        ("BACKGROUND", (2, 0), (2, 0), _SEVERITY_COLOR["Opportunity"]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(badge_table)
+
+    if by_check:
+        story.append(Paragraph("Site-wide patterns", h2_style))
+        rows_sorted = sorted(by_check.items(), key=lambda kv: (_SEVERITY_ORDER.get(kv[1]["type"], 4), -kv[1]["count"]))
+        rows = []
+        for name, info in rows_sorted:
+            color = _SEVERITY_COLOR.get(info["type"], colors.grey)
+            combined = Paragraph(f"<b>{name}</b>", cell_name)
+            count_p = Paragraph(
+                f"<font color='{color.hexval()}'><b>{info['count']} of {len(req.pages)} pages</b></font>",
+                ParagraphStyle("cntX", parent=styles["Normal"], alignment=2, fontSize=9),
+            )
+            rows.append([combined, count_p])
+        tbl = Table(rows, colWidths=[130 * mm, 35 * mm])
+        style_cmds = [
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+        ]
+        for idx, (name, info) in enumerate(rows_sorted):
+            bg = _SEVERITY_BG.get(info["type"])
+            if bg:
+                style_cmds.append(("BACKGROUND", (0, idx), (-1, idx), bg))
+        tbl.setStyle(TableStyle(style_cmds))
+        story.append(tbl)
+
+    if req.pages:
+        story.append(Paragraph("Per-page breakdown (worst first)", h2_style))
+        pages_sorted = sorted(req.pages, key=lambda p: -len(p.findings))
+        rows = []
+        for pg in pages_sorted:
+            issue_count = len(pg.findings)
+            color = colors.HexColor("#B23A2E") if issue_count else colors.HexColor("#1F6F54")
+            names = ", ".join(f.name for f in pg.findings) if pg.findings else "No issues found"
+            combined = Paragraph(f"<font size=9>{pg.url}</font><br/><font size=8 color='#5B6660'>{names}</font>", cell_name)
+            count_p = Paragraph(
+                f"<font color='{color.hexval()}'><b>{issue_count}</b></font>",
+                ParagraphStyle("pgX", parent=styles["Normal"], alignment=2, fontSize=10),
+            )
+            rows.append([combined, count_p])
+        tbl2 = Table(rows, colWidths=[145 * mm, 20 * mm])
+        tbl2.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE1DC")),
+        ]))
+        story.append(tbl2)
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.read()
+
+
+@app.post("/api/report/site-pdf")
+def generate_site_pdf_report(req: SiteReportRequest):
+    pdf_bytes = _build_site_pdf(req)
+    filename = f"site-audit-{req.domain}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
