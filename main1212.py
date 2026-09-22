@@ -13,7 +13,6 @@ Then open http://127.0.0.1:8000/docs for interactive API docs (free, from FastAP
 """
 
 import os
-import re
 from typing import Optional
 
 import httpx
@@ -326,95 +325,6 @@ def _pill(text: str, color) -> Table:
     return tbl
 
 
-class HBar(Flowable):
-    """A rounded percentage bar, used for site-wide pattern visualization."""
-
-    def __init__(self, pct: float, color, width=78 * mm, height=4.6 * mm):
-        Flowable.__init__(self)
-        self.pct = max(0, min(100, pct))
-        self.barcolor = color
-        self.width = width
-        self.height = height
-
-    def wrap(self, availWidth, availHeight):
-        return (self.width, self.height)
-
-    def draw(self):
-        c = self.canv
-        c.setFillColor(colors.HexColor("#E8EBE8"))
-        c.roundRect(0, 0, self.width, self.height, self.height / 2.0, fill=1, stroke=0)
-        if self.pct > 0:
-            fill_w = max(self.width * self.pct / 100.0, self.height)
-            c.setFillColor(self.barcolor)
-            c.roundRect(0, 0, fill_w, self.height, self.height / 2.0, fill=1, stroke=0)
-
-
-class CWVGauge(Flowable):
-    """A zone-shaded gauge (green/amber/red) with a marker at the actual value —
-    same visual language as Google PageSpeed Insights' own Core Web Vitals gauges."""
-
-    def __init__(self, value, good_max, poor_min, scale_max, width=62 * mm, height=4.6 * mm):
-        Flowable.__init__(self)
-        self.value = value
-        self.good_max = good_max
-        self.poor_min = poor_min
-        self.scale_max = scale_max
-        self.width = width
-        self.height = height
-
-    def wrap(self, availWidth, availHeight):
-        return (self.width, self.height + 3 * mm)
-
-    def draw(self):
-        c = self.canv
-        y = 3 * mm
-        good_w = self.width * (self.good_max / self.scale_max)
-        poor_start_w = self.width * (self.poor_min / self.scale_max)
-        c.setFillColor(colors.HexColor("#1F8A5B"))
-        c.roundRect(0, y, good_w, self.height, 1.1 * mm, fill=1, stroke=0)
-        c.setFillColor(colors.HexColor("#D98A0B"))
-        c.rect(good_w, y, max(poor_start_w - good_w, 0), self.height, fill=1, stroke=0)
-        c.setFillColor(colors.HexColor("#C4382B"))
-        c.roundRect(poor_start_w, y, max(self.width - poor_start_w, 0), self.height, 1.1 * mm, fill=1, stroke=0)
-        pos = min(self.width, self.width * (min(self.value, self.scale_max) / self.scale_max))
-        c.setFillColor(colors.HexColor("#151A16"))
-        c.circle(pos, y + self.height / 2.0, 1.7 * mm, fill=1, stroke=0)
-
-
-# Metric name -> (good_max, poor_min, scale_max) for the CWV gauge zones,
-# matching the same thresholds the bookmarklet itself uses to classify good/needs/poor.
-_CWV_SCALES = {
-    "Largest Contentful Paint (LCP)": (2.5, 4.0, 8.0),
-    "Cumulative Layout Shift (CLS)": (0.1, 0.25, 0.5),
-    "Time to First Byte (TTFB)": (800, 1800, 3000),
-    "Full Page Load": (2.5, 4.0, 8.0),
-}
-
-
-def _cwv_row(name: str, detail: str, styles, cell_name):
-    """Builds a gauge row for a Core Web Vitals finding, parsing the numeric value
-    back out of its detail string. Falls back to a plain finding row if the metric
-    isn't recognized or the value can't be parsed."""
-    scales = _CWV_SCALES.get(name)
-    match = re.search(r"[\d.]+", detail) if scales else None
-    if not (scales and match):
-        return None
-    value = float(match.group(0))
-    good_max, poor_min, scale_max = scales
-    unit = "ms" if "TTFB" in name else ("s" if "LCP" in name or "Load" in name else "")
-    name_p = Paragraph(f"<b>{name}</b>", cell_name)
-    value_p = Paragraph(f"<font size=9>{value}{unit}</font>", cell_name)
-    row = Table([[name_p, CWVGauge(value, good_max, poor_min, scale_max), value_p]],
-                colWidths=[52 * mm, 66 * mm, 16 * mm])
-    row.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
-    ]))
-    return row
-
-
 def _section_divider(text: str, styles) -> Table:
     style = ParagraphStyle("divider", parent=styles["Normal"], textColor=colors.white, fontSize=12, alignment=0)
     tbl = Table([[Paragraph(f"<b>{text}</b>", style)]], colWidths=[162 * mm], rowHeights=[10 * mm])
@@ -533,14 +443,7 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
 
     if req.performance_findings:
         story.append(Paragraph("Performance (Core Web Vitals)", h2_style))
-        gauge_rows, plain_findings = [], []
-        for it in req.performance_findings:
-            row = _cwv_row(it.name, it.detail, styles, cell_name)
-            (gauge_rows if row else plain_findings).append(row or it)
-        for row in gauge_rows:
-            story.append(row)
-        if plain_findings:
-            story.append(_finding_table(plain_findings, styles, cell_name))
+        story.append(_finding_table(req.performance_findings, styles, cell_name))
 
     # ---- AI-SEO (GEO / AEO) REPORT section ----
     if req.ai_findings:
@@ -665,14 +568,20 @@ def _build_site_pdf(req: SiteReportRequest) -> bytes:
         for name, info in rows_sorted:
             color = _SEVERITY_COLOR.get(info["type"], colors.grey)
             pages_pct = round(100 * info["count"] / len(req.pages)) if req.pages else 0
-            name_p = Paragraph(f"<b>{name}</b>", cell_name)
-            count_p = Paragraph(f"<font size=8.5>{info['count']}/{len(req.pages)}</font>", cell_name)
-            rows.append([name_p, HBar(pages_pct, color), count_p])
-        tbl = Table(rows, colWidths=[68 * mm, 78 * mm, 16 * mm])
+            combined = Paragraph(
+                f"<b>{name}</b><br/><font size=8 color='#5B6660'>affects {pages_pct}% of crawled pages</font>",
+                cell_name,
+            )
+            count_p = Paragraph(
+                f"<font color='{color.hexval()}'><b>{info['count']} / {len(req.pages)}</b></font>",
+                ParagraphStyle("cntX", parent=styles["Normal"], alignment=2, fontSize=10),
+            )
+            rows.append([combined, count_p])
+        tbl = Table(rows, colWidths=[134 * mm, 28 * mm])
         style_cmds = [
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 6),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 7),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
             ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
             ("LEFTPADDING", (0, 0), (0, -1), 9),
         ]
