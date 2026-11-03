@@ -14,6 +14,7 @@ Then open http://127.0.0.1:8000/docs for interactive API docs (free, from FastAP
 
 import os
 import re
+import traceback
 from typing import Optional
 
 import httpx
@@ -38,6 +39,15 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _allow_private_network(request, call_next):
+    # Lets a bookmarklet running on a public https site reach a server on localhost
+    # (Chrome's Private Network Access / Local Network Access preflight).
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 
 # =========================================================================
@@ -118,7 +128,8 @@ def trace_all_variants(domain: str = Query(..., description="Bare domain, e.g. e
     the exact check the bookmarklet has to ask an external tool for,
     now done properly with real status codes for every hop.
     """
-    bare = domain.replace("http://", "").replace("https://", "").lstrip("www.")
+    bare = domain.replace("http://", "").replace("https://", "").strip("/")
+    bare = re.sub(r"^www\.", "", bare, flags=re.IGNORECASE)
     variants = [
         f"http://{bare}/",
         f"https://{bare}/",
@@ -199,6 +210,7 @@ class FindingItem(BaseModel):
 class ReportRequest(BaseModel):
     url: str
     domain: str
+    logo_url: str = ""
     summary: dict[str, str] = {}
     seo_score: int = 0
     seo_rating: str = ""
@@ -208,6 +220,13 @@ class ReportRequest(BaseModel):
     ai_findings: list[FindingItem] = []
     performance_findings: list[FindingItem] = []
     tech_stack: list[str] = []
+    tech_stack_icons: list[dict] = []
+    keywords_top: list[dict] = []
+    keywords_seed: str = ""
+    social_og: dict[str, str] = {}
+    social_twitter: dict[str, str] = {}
+    tags_found: list[dict] = []
+    redirect_summary: dict = {}
 
 
 _SEVERITY_COLOR = {
@@ -227,7 +246,9 @@ _SEVERITY_ORDER = {"Issue": 0, "Warning": 1, "Opportunity": 2, "Good": 3}
 
 from reportlab.graphics.shapes import Drawing, Circle, String, Wedge
 from reportlab.graphics import renderPDF
-from reportlab.platypus import Flowable, Spacer
+from reportlab.platypus import Flowable, Image, Spacer
+from reportlab.lib.utils import ImageReader
+from xml.sax.saxutils import escape as _esc
 
 
 def _score_color(score: int):
@@ -320,6 +341,51 @@ def _pill(text: str, color) -> Table:
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
         ("LEFTPADDING", (0, 0), (-1, -1), 2),
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    return tbl
+
+
+def ke_(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "\u2026"
+
+
+def _fetch_image_bytes(url: str, timeout: float = 4.0) -> Optional[bytes]:
+    """Best-effort image download. Never raises — a missing logo must not break the report."""
+    if not url:
+        return None
+    try:
+        resp = httpx.get(url, timeout=timeout, follow_redirects=True)
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+def _image_flowable(img_bytes: Optional[bytes], max_w, max_h):
+    """Scale an image to fit within max_w x max_h, preserving aspect ratio."""
+    if not img_bytes:
+        return None
+    try:
+        iw, ih = ImageReader(BytesIO(img_bytes)).getSize()
+        scale = min(max_w / iw, max_h / ih)
+        return Image(BytesIO(img_bytes), width=iw * scale, height=ih * scale)
+    except Exception:
+        return None
+
+
+def _header_block(title_flowables: list, logo_flowable, total_width=162 * mm, logo_width=28 * mm) -> Table:
+    """Title block on the left, website logo (if available) pinned top-right."""
+    right = logo_flowable if logo_flowable is not None else Spacer(1, 1)
+    tbl = Table([[title_flowables, right]], colWidths=[total_width - logo_width, logo_width])
+    tbl.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
         ("TOPPADDING", (0, 0), (-1, -1), 0),
         ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]))
@@ -437,7 +503,9 @@ def _finding_table(items, styles, cell_name) -> Table:
         sub = getattr(it, "detail", None)
         if sub is None:
             sub = f"{it.priority} priority &middot; {it.count} occurrence(s)"
-        combined = Paragraph(f"<b>{it.name}</b><br/><font size=8 color='#5B6660'>{sub}</font>", cell_name)
+        else:
+            sub = _esc(sub)
+        combined = Paragraph(f"<b>{_esc(it.name)}</b><br/><font size=8 color='#5B6660'>{sub}</font>", cell_name)
         rows.append([combined, _pill(it.type, color)])
     tbl = Table(rows, colWidths=[134 * mm, 28 * mm])
     style_cmds = [
@@ -465,14 +533,18 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleX", parent=styles["Title"], alignment=TA_LEFT, fontSize=22, spaceAfter=1, textColor=colors.HexColor("#151A16"))
     sub_style = ParagraphStyle("SubX", parent=styles["Normal"], textColor=colors.HexColor("#5B6660"), fontSize=9.5, spaceAfter=4)
-    h2_style = ParagraphStyle("H2X", parent=styles["Heading2"], fontSize=12, spaceBefore=14, spaceAfter=6, textColor=colors.HexColor("#151A16"))
+    h2_style = ParagraphStyle("H2X", parent=styles["Heading2"], fontSize=12, spaceBefore=14, spaceAfter=6, keepWithNext=1, textColor=colors.HexColor("#151A16"))
     cell_name = ParagraphStyle("CellName", parent=styles["Normal"], fontSize=9.5, textColor=colors.HexColor("#151A16"), leading=12.5)
     cell_meta = ParagraphStyle("CellMeta", parent=styles["Normal"], fontSize=8, textColor=colors.HexColor("#5B6660"), leading=11)
 
-    story = [
+    logo_flow = _image_flowable(_fetch_image_bytes(req.logo_url), 26 * mm, 26 * mm)
+    title_block = [
         Paragraph("SEO Audit Report", title_style),
-        Paragraph(f"{req.url}", sub_style),
+        Paragraph(f"{_esc(req.url)}", sub_style),
         Paragraph(f"Generated {datetime.now(timezone.utc).strftime('%d %B %Y')}", sub_style),
+    ]
+    story = [
+        _header_block(title_block, logo_flow),
         Spacer(1, 6 * mm),
     ]
 
@@ -511,7 +583,7 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
 
     if req.summary:
         story.append(Paragraph("Page summary", h2_style))
-        sum_rows = [[Paragraph(f"<b>{k}</b>", cell_meta), Paragraph(v or "&mdash;", cell_name)] for k, v in req.summary.items()]
+        sum_rows = [[Paragraph(f"<b>{k}</b>", cell_meta), Paragraph(_esc(v) if v else "&mdash;", cell_name)] for k, v in req.summary.items()]
         sum_table = Table(sum_rows, colWidths=[32 * mm, 130 * mm])
         sum_table.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
@@ -527,9 +599,65 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
         story.append(Paragraph("On-page findings", h2_style))
         story.append(_finding_table(req.issues, styles, cell_name))
 
+    if req.keywords_top:
+        story.append(Paragraph("Top content keyword phrases", h2_style))
+        if req.keywords_seed:
+            story.append(Paragraph(f"<font size=8.5 color='#5B6660'>Suggested seed keyword: </font><b>{_esc(req.keywords_seed)}</b>", cell_name))
+            story.append(Spacer(1, 3 * mm))
+        kw_rows = []
+        for kw in req.keywords_top[:10]:
+            score = kw.get("score")
+            count = kw.get("count")
+            meta = f"{count} occurrence(s)" if count is not None else ""
+            kw_rows.append([
+                Paragraph(f"<b>{_esc(str(kw.get('phrase', '')))}</b><br/><font size=8 color='#5B6660'>{meta}</font>", cell_name),
+                HBar(score if score is not None else 0, _score_color(score or 0), width=40 * mm),
+                Paragraph(f"<font size=9>{score}/100</font>" if score is not None else "", cell_name),
+            ])
+        kw_tbl = Table(kw_rows, colWidths=[84 * mm, 44 * mm, 34 * mm])
+        kw_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
+            ("LEFTPADDING", (0, 0), (0, -1), 9),
+        ]))
+        story.append(kw_tbl)
+
     if req.schema_findings:
         story.append(Paragraph("Schema.org markup", h2_style))
         story.append(_finding_table(req.schema_findings, styles, cell_name))
+
+    if req.social_og or req.social_twitter:
+        story.append(Paragraph("Social tags (Open Graph / Twitter)", h2_style))
+        soc_rows = []
+        for k, v in list((req.social_og or {}).items()) + list((req.social_twitter or {}).items()):
+            soc_rows.append([Paragraph(f"<b>{_esc(str(k))}</b>", cell_meta), Paragraph(_esc(ke_(str(v), 90)), cell_name)])
+        soc_tbl = Table(soc_rows, colWidths=[42 * mm, 120 * mm])
+        soc_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F7F8F7")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(soc_tbl)
+
+    if req.tags_found:
+        story.append(Paragraph("Google tags found", h2_style))
+        tag_rows = [[Paragraph(f"<b>{_esc(str(tg.get('label', '')))}</b>", cell_name),
+                     Paragraph(f"<font face='Courier' size=8.5>{_esc(ke_(str(tg.get('code', '')), 70))}</font>", cell_name)]
+                    for tg in req.tags_found]
+        tag_tbl = Table(tag_rows, colWidths=[56 * mm, 106 * mm])
+        tag_tbl.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("LEFTPADDING", (0, 0), (0, -1), 9),
+        ]))
+        story.append(tag_tbl)
 
     if req.performance_findings:
         story.append(Paragraph("Performance (Core Web Vitals)", h2_style))
@@ -542,6 +670,26 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
         if plain_findings:
             story.append(_finding_table(plain_findings, styles, cell_name))
 
+    if req.redirect_summary:
+        story.append(Paragraph("Redirects (www / https variants)", h2_style))
+        rd_rows = []
+        for label in ("HTTP", "HTTPS", "HTTP + WWW", "HTTPS + WWW"):
+            info = req.redirect_summary.get(label)
+            if info:
+                rd_rows.append([Paragraph(f"<b>{label}</b>", cell_meta),
+                                Paragraph(f"<font size=8.5>{_esc(ke_(str(info.get('status_text', 'Not checked')), 110))}</font>", cell_name)])
+        if rd_rows:
+            rd_tbl = Table(rd_rows, colWidths=[32 * mm, 130 * mm])
+            rd_tbl.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LINEBELOW", (0, 0), (-1, -1), 0.5, colors.HexColor("#E8EBE8")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F7F8F7")),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ]))
+            story.append(rd_tbl)
+
     # ---- AI-SEO (GEO / AEO) REPORT section ----
     if req.ai_findings:
         story.append(Spacer(1, 7 * mm))
@@ -552,9 +700,27 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
     if req.tech_stack:
         story.append(Paragraph("Detected technologies", h2_style))
         chip_style = ParagraphStyle("chip", parent=styles["Normal"], fontSize=8.5, leading=11, textColor=colors.HexColor("#151A16"))
+        icon_by_name = {ic.get("name"): ic.get("icon_url") for ic in (req.tech_stack_icons or [])}
+        icons_used = [0]
+
+        def _chip_cell(name):
+            url = icon_by_name.get(name)
+            if url and icons_used[0] < 12:
+                icons_used[0] += 1
+                icon = _image_flowable(_fetch_image_bytes(url, timeout=3.0), 4 * mm, 4 * mm)
+                if icon:
+                    inner = Table([[icon, Paragraph(_esc(name), chip_style)]], colWidths=[6 * mm, 46 * mm])
+                    inner.setStyle(TableStyle([
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                        ("TOPPADDING", (0, 0), (-1, -1), 0), ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                    ]))
+                    return inner
+            return Paragraph(_esc(name), chip_style)
+
         rows, row = [], []
         for name in req.tech_stack:
-            row.append(Paragraph(name, chip_style))
+            row.append(_chip_cell(name))
             if len(row) == 3:
                 rows.append(row)
                 row = []
@@ -580,7 +746,16 @@ def _build_report_pdf(req: ReportRequest) -> bytes:
 
 @app.post("/api/report/pdf")
 def generate_pdf_report(req: ReportRequest):
-    pdf_bytes = _build_report_pdf(req)
+    try:
+        pdf_bytes = _build_report_pdf(req)
+    except Exception:
+        traceback.print_exc()
+        try:
+            safe = req.model_copy(update={"logo_url": "", "tech_stack_icons": [], "keywords_top": [], "social_og": {}, "social_twitter": {}, "tags_found": [], "redirect_summary": {}})
+            pdf_bytes = _build_report_pdf(safe)
+        except Exception as exc:
+            traceback.print_exc()
+            raise HTTPException(500, f"Report generation failed: {exc}")
     filename = f"seo-audit-{req.domain}.pdf"
     return Response(
         content=pdf_bytes,
@@ -602,6 +777,7 @@ class SitePageResult(BaseModel):
 
 class SiteReportRequest(BaseModel):
     domain: str
+    logo_url: str = ""
     pages: list[SitePageResult] = []
 
 
@@ -614,13 +790,17 @@ def _build_site_pdf(req: SiteReportRequest) -> bytes:
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("TitleX2", parent=styles["Title"], alignment=TA_LEFT, fontSize=22, spaceAfter=1, textColor=colors.HexColor("#151A16"))
     sub_style = ParagraphStyle("SubX2", parent=styles["Normal"], textColor=colors.HexColor("#5B6660"), fontSize=9.5, spaceAfter=4)
-    h2_style = ParagraphStyle("H2X2", parent=styles["Heading2"], fontSize=12, spaceBefore=14, spaceAfter=6, textColor=colors.HexColor("#151A16"))
+    h2_style = ParagraphStyle("H2X2", parent=styles["Heading2"], fontSize=12, spaceBefore=14, spaceAfter=6, keepWithNext=1, textColor=colors.HexColor("#151A16"))
     cell_name = ParagraphStyle("CellName2", parent=styles["Normal"], fontSize=9.5, textColor=colors.HexColor("#151A16"), leading=12.5)
 
-    story = [
+    logo_flow = _image_flowable(_fetch_image_bytes(req.logo_url), 26 * mm, 26 * mm)
+    title_block = [
         Paragraph("Full Site SEO Audit", title_style),
         Paragraph(f"{req.domain}", sub_style),
         Paragraph(f"Generated {datetime.now(timezone.utc).strftime('%d %B %Y')} &middot; {len(req.pages)} page(s) crawled", sub_style),
+    ]
+    story = [
+        _header_block(title_block, logo_flow),
         Spacer(1, 6 * mm),
     ]
 
@@ -725,7 +905,15 @@ def _build_site_pdf(req: SiteReportRequest) -> bytes:
 
 @app.post("/api/report/site-pdf")
 def generate_site_pdf_report(req: SiteReportRequest):
-    pdf_bytes = _build_site_pdf(req)
+    try:
+        pdf_bytes = _build_site_pdf(req)
+    except Exception:
+        traceback.print_exc()
+        try:
+            pdf_bytes = _build_site_pdf(req.model_copy(update={"logo_url": ""}))
+        except Exception as exc:
+            traceback.print_exc()
+            raise HTTPException(500, f"Site report generation failed: {exc}")
     filename = f"site-audit-{req.domain}.pdf"
     return Response(
         content=pdf_bytes,
